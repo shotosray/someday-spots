@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+import os
 import sqlite3
 from pathlib import Path
 from typing import Literal
@@ -48,7 +49,8 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="With Friends API", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
+allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["*"], allow_headers=["*"])
 
 class FriendCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
