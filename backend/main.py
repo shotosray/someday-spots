@@ -48,7 +48,7 @@ async def lifespan(app: FastAPI):
     initialize_db()
     yield
 
-app = FastAPI(title="With Friends API", lifespan=lifespan)
+app = FastAPI(title="Someday Spots API", lifespan=lifespan)
 allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["*"], allow_headers=["*"])
 
