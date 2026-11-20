@@ -1,73 +1,40 @@
-from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 import os
-import sqlite3
-from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from supabase import create_client
 
-# This file is created automatically on the first local run.  It is intentionally
-# not committed, and can later be replaced by a hosted database connection.
-DB_PATH = Path(__file__).parent / "friend_plans_local.db"
-
-def connection():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA foreign_keys = ON")
-    return db
-
-def initialize_db():
-    with connection() as db:
-        db.executescript("""
-        CREATE TABLE IF NOT EXISTS friends (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          name TEXT NOT NULL COLLATE NOCASE,
-          created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS activities (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          friend_id INTEGER NOT NULL REFERENCES friends(id) ON DELETE CASCADE,
-          place_name TEXT NOT NULL,
-          maps_url TEXT NOT NULL,
-          planning_notes TEXT,
-          status TEXT NOT NULL DEFAULT 'todo' CHECK(status IN ('todo', 'done')),
-          rating INTEGER CHECK(rating BETWEEN 1 AND 5),
-          review TEXT,
-          visit_date TEXT,
-          created_at TEXT NOT NULL,
-          completed_at TEXT
-        );
-        """)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    initialize_db()
-    yield
-
-app = FastAPI(title="Someday Spots API", lifespan=lifespan)
+app = FastAPI(title="Someday Spots API")
 allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["*"], allow_headers=["*"])
 
+
 class FriendCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+
     @field_validator("name")
     @classmethod
     def clean_name(cls, value: str):
         value = value.strip()
-        if not value: raise ValueError("Name is required")
+        if not value:
+            raise ValueError("Name is required")
         return value
+
 
 class ActivityCreate(BaseModel):
     place_name: str = Field(min_length=1, max_length=140)
     maps_url: str
     planning_notes: str | None = Field(default=None, max_length=1500)
+
     @field_validator("place_name")
     @classmethod
-    def clean_place(cls, value: str): return value.strip()
+    def clean_place(cls, value: str):
+        return value.strip()
+
     @field_validator("maps_url")
     @classmethod
     def valid_url(cls, value: str):
@@ -79,51 +46,125 @@ class ActivityCreate(BaseModel):
             raise ValueError("Enter a Google Maps link")
         return value.strip()
 
+
 class CompleteActivity(BaseModel):
     rating: int | None = Field(default=None, ge=1, le=5)
     review: str | None = Field(default=None, max_length=1500)
     visit_date: date | None = None
 
-def one_friend(db, friend_id: int):
-    friend = db.execute("SELECT * FROM friends WHERE id = ?", (friend_id,)).fetchone()
-    if not friend: raise HTTPException(404, "Friend not found")
-    return friend
+
+def supabase():
+    url = os.getenv("SUPABASE_URL")
+    secret = os.getenv("SUPABASE_SECRET_KEY")
+    if not url or not secret:
+        raise HTTPException(503, "The server is not connected to Supabase yet")
+    return create_client(url, secret)
+
+
+def current_user_id(authorization: Annotated[str | None, Header()] = None) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Please sign in to continue")
+    try:
+        user = supabase().auth.get_user(authorization.removeprefix("Bearer ")).user
+    except Exception as exc:
+        raise HTTPException(401, "Your session has expired. Please sign in again.") from exc
+    if not user:
+        raise HTTPException(401, "Your session has expired. Please sign in again.")
+    return str(user.id)
+
+
+CurrentUser = Annotated[str, Depends(current_user_id)]
+
+
+def first_or_404(response, message: str):
+    if not response.data:
+        raise HTTPException(404, message)
+    return response.data[0]
+
 
 @app.get("/api/friends")
-def list_friends(q: str = Query(default="", max_length=80)):
-    with connection() as db:
-        return [dict(row) for row in db.execute("SELECT f.*, COUNT(a.id) AS activity_count FROM friends f LEFT JOIN activities a ON a.friend_id=f.id WHERE f.name LIKE ? GROUP BY f.id ORDER BY f.name COLLATE NOCASE", (f"%{q.strip()}%",))]
+def list_friends(owner_id: CurrentUser, q: str = Query(default="", max_length=80)):
+    client = supabase()
+    try:
+        friends = client.table("friends").select("id,name,created_at").eq("owner_id", owner_id).ilike("name", f"%{q.strip()}%").order("name").execute().data
+        activities = client.table("activities").select("friend_id").eq("owner_id", owner_id).execute().data
+    except Exception as exc:
+        raise HTTPException(502, "Unable to load your spots right now") from exc
+    counts = {}
+    for activity in activities:
+        counts[activity["friend_id"]] = counts.get(activity["friend_id"], 0) + 1
+    return [{**friend, "activity_count": counts.get(friend["id"], 0)} for friend in friends]
+
 
 @app.post("/api/friends", status_code=201)
-def create_friend(body: FriendCreate):
-    with connection() as db:
-        cursor = db.execute("INSERT INTO friends(name, created_at) VALUES (?, ?)", (body.name, datetime.now(timezone.utc).isoformat()))
-        return dict(db.execute("SELECT * FROM friends WHERE id=?", (cursor.lastrowid,)).fetchone())
+def create_friend(body: FriendCreate, owner_id: CurrentUser):
+    try:
+        response = supabase().table("friends").insert({"owner_id": owner_id, "name": body.name}).execute()
+        return first_or_404(response, "Friend could not be created")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "Unable to save that friend. Please try again.") from exc
+
+
+def owned_friend(client, friend_id: str, owner_id: str):
+    response = client.table("friends").select("id,name,created_at").eq("id", friend_id).eq("owner_id", owner_id).execute()
+    return first_or_404(response, "Friend not found")
+
 
 @app.get("/api/friends/{friend_id}")
-def get_friend(friend_id: int):
-    with connection() as db: return dict(one_friend(db, friend_id))
+def get_friend(friend_id: str, owner_id: CurrentUser):
+    return owned_friend(supabase(), friend_id, owner_id)
+
 
 @app.get("/api/friends/{friend_id}/activities")
-def list_activities(friend_id: int, status: Literal["todo", "done"] = "todo"):
-    with connection() as db:
-        one_friend(db, friend_id)
-        ordering = "completed_at DESC" if status == "done" else "created_at DESC"
-        return [dict(row) for row in db.execute(f"SELECT * FROM activities WHERE friend_id=? AND status=? ORDER BY {ordering}", (friend_id, status))]
+def list_activities(friend_id: str, owner_id: CurrentUser, status: Literal["todo", "done"] = "todo"):
+    client = supabase()
+    owned_friend(client, friend_id, owner_id)
+    ordering = "completed_at" if status == "done" else "created_at"
+    try:
+        return client.table("activities").select("*").eq("owner_id", owner_id).eq("friend_id", friend_id).eq("status", status).order(ordering, desc=True).execute().data
+    except Exception as exc:
+        raise HTTPException(502, "Unable to load spots right now") from exc
+
 
 @app.post("/api/friends/{friend_id}/activities", status_code=201)
-def create_activity(friend_id: int, body: ActivityCreate):
-    with connection() as db:
-        one_friend(db, friend_id)
-        now = datetime.now(timezone.utc).isoformat()
-        cur = db.execute("INSERT INTO activities(friend_id, place_name, maps_url, planning_notes, created_at) VALUES (?, ?, ?, ?, ?)", (friend_id, body.place_name, body.maps_url, body.planning_notes.strip() if body.planning_notes else None, now))
-        return dict(db.execute("SELECT * FROM activities WHERE id=?", (cur.lastrowid,)).fetchone())
+def create_activity(friend_id: str, body: ActivityCreate, owner_id: CurrentUser):
+    client = supabase()
+    owned_friend(client, friend_id, owner_id)
+    activity = {
+        "owner_id": owner_id,
+        "friend_id": friend_id,
+        "place_name": body.place_name,
+        "maps_url": body.maps_url,
+        "planning_notes": body.planning_notes.strip() if body.planning_notes else None,
+    }
+    try:
+        response = client.table("activities").insert(activity).execute()
+        return first_or_404(response, "Spot could not be created")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "Unable to save that spot. Please try again.") from exc
+
 
 @app.post("/api/activities/{activity_id}/complete")
-def complete_activity(activity_id: int, body: CompleteActivity):
-    with connection() as db:
-        activity = db.execute("SELECT * FROM activities WHERE id=?", (activity_id,)).fetchone()
-        if not activity: raise HTTPException(404, "Activity not found")
-        if activity["status"] == "done": raise HTTPException(409, "This activity is already done")
-        db.execute("UPDATE activities SET status='done', rating=?, review=?, visit_date=?, completed_at=? WHERE id=?", (body.rating, body.review.strip() if body.review else None, body.visit_date.isoformat() if body.visit_date else None, datetime.now(timezone.utc).isoformat(), activity_id))
-        return dict(db.execute("SELECT * FROM activities WHERE id=?", (activity_id,)).fetchone())
+def complete_activity(activity_id: str, body: CompleteActivity, owner_id: CurrentUser):
+    client = supabase()
+    activity = first_or_404(client.table("activities").select("id,status").eq("id", activity_id).eq("owner_id", owner_id).execute(), "Spot not found")
+    if activity["status"] == "done":
+        raise HTTPException(409, "This spot is already done")
+    completed = {
+        "status": "done",
+        "rating": body.rating,
+        "review": body.review.strip() if body.review else None,
+        "visit_date": body.visit_date.isoformat() if body.visit_date else None,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        response = client.table("activities").update(completed).eq("id", activity_id).eq("owner_id", owner_id).execute()
+        return first_or_404(response, "Spot could not be updated")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(502, "Unable to save your review. Please try again.") from exc

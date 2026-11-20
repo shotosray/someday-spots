@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
+    "@supabase/supabase-js": "^2.49.4",
     "react": "latest",
     "react-dom": "latest",
     "vite": "latest"
